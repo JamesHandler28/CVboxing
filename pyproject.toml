@@ -10,8 +10,8 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "opencv-python>=4.8",
-    "mediapipe>=0.10",
-    "numpy>=1.24",
+    "mediapipe==0.10.21",
+    "numpy>=1.24,<2",
 ]
 
 [project.optional-dependencies]
