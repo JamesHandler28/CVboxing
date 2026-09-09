@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wiiboxing"
+version = "0.1.0"
+description = "Webcam boxing move detection using MediaPipe pose estimation"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "opencv-python>=4.8",
+    "mediapipe>=0.10",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "scikit-learn>=1.3",  # only needed for refitting the classifier from collected CSVs
+]
+
+[project.scripts]
+wiiboxing-detect = "wiiboxing.cli:detect"
+wiiboxing-play = "wiiboxing.cli:play"
+wiiboxing-duel = "wiiboxing.cli:duel"
+
+[tool.setuptools.packages.find]
+include = ["wiiboxing*"]
