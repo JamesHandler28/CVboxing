@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from . import config
+from .appearance import DEFAULT_APPEARANCE
 
 
 def _vgradient_fill(image, x_offset, y0, y1, half_w, color_top, color_bottom):
@@ -76,30 +77,43 @@ def _rel(landmark, ref_x, ref_y, shoulder_w):
     return (landmark.x - ref_x) / shoulder_w, (landmark.y - ref_y) / shoulder_w
 
 
-def draw_opponent(image, x_offset, half_w, half_h, lean_offset, fl=None, downed=False):
+def _dim(color, factor):
+    return tuple(int(c * factor) for c in color)
+
+
+def draw_opponent(image, x_offset, half_w, half_h, lean_offset, fl=None, downed=False, appearance=None):
     """Opponent: head, torso, and (when we have their live pose) actual
     arms swinging with their real punches. Mirrored horizontally -- their
     real-world rightward lean/punch should appear shifted toward your left,
-    since you're facing each other."""
+    since you're facing each other.
+
+    `appearance` is the skin/hair/shirt/pants BGR palette sampled once
+    during calibration (see appearance.py) -- if omitted, a neutral
+    default palette is used instead. Gloves stay a fixed, clearly-readable
+    color regardless of appearance, so hands/blocking are always easy to
+    track at a glance."""
+    appearance = appearance or DEFAULT_APPEARANCE
+    skin, hair, shirt = appearance["skin"], appearance["hair"], appearance["shirt"]
+    pants = appearance["pants"]
+
     shift_px = -lean_offset * half_w * 0.25 * config.LEAN_RENDER_SCALE
-    color = (100, 100, 220) if downed else (225, 225, 225)
     glove_color = (60, 60, 230)
 
     if downed:
         center_x = x_offset + half_w / 2 + shift_px
         head_y, torso_y = half_h * 0.60, half_h * 0.62
         torso_axes = (int(half_w * 0.20), int(half_h * 0.06))
-        cv2.ellipse(image, (int(center_x), int(torso_y)), torso_axes, 0, 0, 360, color, -1)
-        cv2.circle(image, (int(center_x), int(head_y)), int(half_w * 0.09), color, -1)
+        cv2.ellipse(image, (int(center_x), int(torso_y)), torso_axes, 0, 0, 360, _dim(shirt, 0.55), -1)
+        cv2.circle(image, (int(center_x), int(head_y)), int(half_w * 0.09), _dim(skin, 0.55), -1)
         return
 
     if fl is None:
-        # No live pose to work with (e.g. a static dummy) -- simple blob.
+        # No live pose to work with -- simple blob.
         center_x = x_offset + half_w / 2 + shift_px
         head_r = int(half_w * 0.09)
         torso_axes = (int(half_w * 0.13), int(half_h * 0.16))
-        cv2.ellipse(image, (int(center_x), int(half_h * 0.50)), torso_axes, 0, 0, 360, color, -1)
-        cv2.circle(image, (int(center_x), int(half_h * 0.30)), head_r, color, -1)
+        cv2.ellipse(image, (int(center_x), int(half_h * 0.50)), torso_axes, 0, 0, 360, shirt, -1)
+        cv2.circle(image, (int(center_x), int(half_h * 0.30)), head_r, skin, -1)
         return
 
     anchor_x, anchor_y, scale = _anchor_and_scale(fl, half_w, half_h, shift_px)
@@ -121,28 +135,92 @@ def draw_opponent(image, x_offset, half_w, half_h, lean_offset, fl=None, downed=
     shoulder_mid = ((l_shoulder[0] + r_shoulder[0]) // 2, (l_shoulder[1] + r_shoulder[1]) // 2)
     hip_pt = (shoulder_mid[0], shoulder_mid[1] + int(scale * 0.7))
 
-    # Torso, then a neck line bridging to the head (keeps the head from
+    # Torso, then a waistband hint of pants color at the bottom of the
+    # torso, then a neck line bridging to the head (keeps the head from
     # reading as a disconnected floating circle when its tracked distance
     # from the shoulders doesn't neatly match the fixed torso proportions
-    # below), then arms, then head on top.
+    # below), then arms, then head + hair on top.
     torso_axes = (int(scale * 0.22), int(scale * 0.32))
     torso_center = ((shoulder_mid[0] + hip_pt[0]) // 2, (shoulder_mid[1] + hip_pt[1]) // 2)
-    cv2.ellipse(image, torso_center, torso_axes, 0, 0, 360, color, -1)
-    cv2.line(image, shoulder_mid, head_pt, color, max(6, int(scale * 0.10)))
+    cv2.ellipse(image, torso_center, torso_axes, 0, 0, 360, shirt, -1)
+    waist_y = torso_center[1] + int(torso_axes[1] * 0.55)
+    cv2.ellipse(image, (torso_center[0], waist_y), (torso_axes[0], max(3, int(torso_axes[1] * 0.3))),
+                0, 0, 360, pants, -1)
+    cv2.line(image, shoulder_mid, head_pt, shirt, max(6, int(scale * 0.10)))
 
     for shoulder, elbow, wrist in ((l_shoulder, l_elbow, l_wrist), (r_shoulder, r_elbow, r_wrist)):
-        cv2.line(image, shoulder, elbow, color, max(4, int(scale * 0.05)))
-        cv2.line(image, elbow, wrist, color, max(4, int(scale * 0.05)))
-        cv2.circle(image, wrist, max(6, int(scale * 0.07)), glove_color, -1)
-        cv2.circle(image, wrist, max(6, int(scale * 0.07)), (255, 255, 255), 2)
+        cv2.line(image, shoulder, elbow, shirt, max(4, int(scale * 0.05)))
+        cv2.line(image, elbow, wrist, skin, max(4, int(scale * 0.05)))
+        cv2.circle(image, wrist, max(7, int(scale * 0.08)), glove_color, -1)
+        cv2.circle(image, wrist, max(7, int(scale * 0.08)), (255, 255, 255), 2)
 
-    cv2.circle(image, head_pt, int(scale * 0.16), color, -1)
+    cv2.circle(image, head_pt, int(scale * 0.16), skin, -1)
+    cv2.ellipse(image, (head_pt[0], head_pt[1] - int(scale * 0.06)), (int(scale * 0.17), int(scale * 0.11)),
+                0, 180, 360, hair, -1)
 
 
-def draw_own_hands(image, x_offset, half_w, half_h, left_wrist_norm, right_wrist_norm):
+def draw_floating_sphere(image, center_x, center_y, radius, base_color, now):
+    """Render a recovery target as a glowing floating orb instead of a flat
+    ring: a soft pulsing outer glow, a few darkening concentric circles to
+    fake sphere shading without a real lighting model, and a glossy
+    highlight."""
+    pulse = 0.5 + 0.5 * np.sin(now * 3.0)
+    glow_r = int(radius * (1.25 + 0.15 * pulse))
+    overlay = image.copy()
+    cv2.circle(overlay, (center_x, center_y), glow_r, base_color, -1)
+    cv2.addWeighted(overlay, 0.25, image, 0.75, 0, dst=image)
+
+    steps = 4
+    for i in range(steps, 0, -1):
+        r = int(radius * i / steps)
+        factor = 0.5 + 0.5 * (i / steps)
+        shaded = tuple(int(c * factor) for c in base_color)
+        cv2.circle(image, (center_x, center_y), r, shaded, -1)
+
+    hi_r = max(3, int(radius * 0.28))
+    hi_offset = int(radius * 0.35)
+    cv2.circle(image, (center_x - hi_offset, center_y - hi_offset), hi_r, (255, 255, 255), -1)
+
+    cv2.circle(image, (center_x, center_y), radius, (255, 255, 255), 2)
+
+
+def draw_impact_flash(image, x_offset, cx, cy, age, duration):
+    """An expanding, fading burst at (cx, cy) -- a bright core circle plus a
+    few radiating spike lines, comic-panel style, without any text. `age`
+    and `duration` are both in seconds; the effect is fully transparent
+    once age >= duration (caller is expected to drop it at that point)."""
+    t = max(0.0, min(1.0, age / duration))
+    alpha = 1.0 - t
+    if alpha <= 0:
+        return
+
+    base_radius = 18
+    radius = int(base_radius + 40 * t)
+    center = (x_offset + int(cx), int(cy))
+
+    overlay = image.copy()
+    cv2.circle(overlay, center, radius, (255, 255, 255), -1)
+    cv2.addWeighted(overlay, 0.6 * alpha, image, 1 - 0.6 * alpha, 0, dst=image)
+
+    for angle_deg in range(0, 360, 45):
+        rad = np.deg2rad(angle_deg)
+        x2 = center[0] + int(radius * 1.4 * np.cos(rad))
+        y2 = center[1] + int(radius * 1.4 * np.sin(rad))
+        cv2.line(image, center, (x2, y2), (255, 255, 255), max(2, int(4 * alpha)))
+
+
+def draw_own_hands(image, x_offset, half_w, half_h, left_wrist_norm, right_wrist_norm, appearance=None):
     """Own hands as glove-like shapes, each with a forearm line back to a
-    fixed shoulder anchor near the bottom corners, so movement reads as
-    an arm swinging rather than a disconnected dot."""
+    fixed shoulder anchor near the bottom corners, so movement reads as an
+    arm swinging rather than a disconnected dot. The forearm line is drawn
+    in two segments (shirt-colored near the shoulder, skin-colored near
+    the wrist) using the sampled appearance palette, if provided. Gloves
+    stay a fixed, clearly-readable color -- and are a bit bigger than a
+    bare fist, matching the enlarged blocking hitbox (see
+    GLOVE_BLOCK_COVERAGE in config.py)."""
+    appearance = appearance or DEFAULT_APPEARANCE
+    skin, shirt = appearance["skin"], appearance["shirt"]
+
     anchors = {
         "left": (x_offset + int(half_w * 0.20), int(half_h * 0.95)),
         "right": (x_offset + int(half_w * 0.80), int(half_h * 0.95)),
@@ -155,10 +233,13 @@ def draw_own_hands(image, x_offset, half_w, half_h, left_wrist_norm, right_wrist
         x = x_offset + int(wrist_norm[0] * half_w)
         y = int(wrist_norm[1] * half_h)
         anchor = anchors[side]
+        mid = ((anchor[0] + x) // 2, (anchor[1] + y) // 2)
 
-        cv2.line(image, anchor, (x, y), (230, 210, 190), max(6, int(half_w * 0.02)))
+        thickness = max(6, int(half_w * 0.02))
+        cv2.line(image, anchor, mid, shirt, thickness)
+        cv2.line(image, mid, (x, y), skin, thickness)
 
-        glove_r = max(16, int(half_w * 0.05))
+        glove_r = max(18, int(half_w * 0.058))
         cv2.circle(image, (x, y), glove_r, color, -1)
         cv2.circle(image, (x, y), glove_r, (20, 20, 20), 2)
         # Small highlight for a bit of shading.

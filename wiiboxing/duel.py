@@ -1,19 +1,17 @@
 """
 Duel mode: menu -> calibration -> fight.
 
-1-player: solo practice against a static dummy (full-frame view, no HP/
-knockdown for you -- just a hit counter).
-
-2-player: split frame in half (one MediaPipe Pose model per half, since the
-classic Pose solution only tracks one person at a time). Each player sees
-their own hands and the opponent's silhouette, mirrored so that leaning
-your real right shifts your on-screen position left from the opponent's
-point of view. Landing a punch (classified the same way as freeplay mode --
-jab/hook/uppercut, HEAD/BODY/LOW zone) damages the opponent unless they're
-leaning far enough to dodge a head shot. Zero HP knocks a player down; they
-get a time-limited window to punch a floating recovery target back up
-(reusing the same target logic as freeplay mode), at the cost of lower max
-HP each time. Failing a recovery window loses the match.
+Two-player only: split frame in half (one MediaPipe Pose model per half,
+since the classic Pose solution only tracks one person at a time). Each
+player sees their own hands and the opponent's silhouette, mirrored so that
+leaning your real right shifts your on-screen position left from the
+opponent's point of view. Landing a punch (classified the same way as
+freeplay mode -- jab/hook/uppercut, HEAD/BODY/LOW zone) damages the
+opponent unless they're leaning far enough to dodge a head shot, or their
+own glove is covering that zone (blocked). Zero HP knocks a player down;
+they get a time-limited window to punch floating recovery targets back up,
+with returned HP scaling by performance -- see duel_state.py. A player's
+MAX_KNOCKDOWNS'th knockdown is an automatic KO.
 """
 
 import time
@@ -22,13 +20,14 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from . import config
+from . import config, sound
+from .appearance import DEFAULT_APPEARANCE, sample_appearance
 from .calibration import check_position
 from .classifier import classify_from_summary_left, classify_from_summary_right
 from .duel_state import GAME_OVER, KNOCKDOWN, PLAYING, PlayerState, damage_for_zone, is_dodged
 from .landmarks import extract
-from .pose_utils import classify_height
-from .ring_render import draw_opponent, draw_own_hands, draw_ring_background
+from .pose_utils import classify_height, glove_covers_zone
+from .ring_render import draw_floating_sphere, draw_impact_flash, draw_opponent, draw_own_hands, draw_ring_background
 from .targets import check_hit, spawn_target
 from .tracker import ArmMotionTracker
 
@@ -40,8 +39,10 @@ MENU, CALIBRATION, FIGHT = "MENU", "CALIBRATION", "FIGHT"
 class PlayerRuntime:
     """Everything about an active (real) player that isn't pure HP/knockdown
     logic: per-arm motion trackers (used while PLAYING), the current
-    recovery target (used while KNOCKDOWN), and the calibrated neutral lean
-    baseline captured before the fight started."""
+    recovery target (used while KNOCKDOWN), the calibrated neutral lean
+    baseline captured before the fight started, and the skin/hair/shirt/
+    pants palette sampled from the camera during calibration (see
+    appearance.py)."""
 
     def __init__(self):
         self.trackers = {
@@ -51,22 +52,7 @@ class PlayerRuntime:
         self.recovery_target = None
         self.baseline_midline_x_px = None
         self.calibration_hold_start = None
-
-
-class DummyOpponent:
-    """The stationary practice-dummy opponent for 1-player mode. Never
-    dodges, never attacks back, no HP -- just tallies what connected."""
-
-    def __init__(self):
-        self.hits_by_zone = {"HEAD": 0, "BODY": 0, "LOW": 0}
-        self.lean_offset = 0.0
-
-    def take_hit(self, zone):
-        self.hits_by_zone[zone] += 1
-
-    @property
-    def total_hits(self):
-        return sum(self.hits_by_zone.values())
+        self.appearance = dict(DEFAULT_APPEARANCE)
 
 
 def _lean_offset(fl, half_w, baseline_midline_x_px):
@@ -74,6 +60,18 @@ def _lean_offset(fl, half_w, baseline_midline_x_px):
         return 0.0
     current_x_px = fl.midline_x * half_w
     return (current_x_px - baseline_midline_x_px) / (fl.shoulder_width * half_w)
+
+
+def _is_blocked(defender_fl, zone):
+    """A punch aimed at `zone` is blocked if the DEFENDER's own wrist --
+    given an enlarged, glove-sized hitbox -- is currently covering it."""
+    if defender_fl is None:
+        return False
+    for wrist in (defender_fl.left_wrist, defender_fl.right_wrist):
+        if glove_covers_zone(wrist, defender_fl.nose, defender_fl.hip_y,
+                              defender_fl.shoulder_width, zone, config.GLOVE_BLOCK_COVERAGE):
+            return True
+    return False
 
 
 def _run_calibration_frame(image_half, half_w, half_h, pose_model, runtime, now):
@@ -94,6 +92,10 @@ def _run_calibration_frame(image_half, half_w, half_h, pose_model, runtime, now)
     if ok:
         if runtime.calibration_hold_start is None:
             runtime.calibration_hold_start = now
+        # Sample colors on every well-positioned frame (not just once) so
+        # by the time the hold completes, runtime.appearance reflects a
+        # recent, correctly-framed reading rather than a stale early one.
+        runtime.appearance = sample_appearance(image_half, fl, half_w, half_h)
     else:
         runtime.calibration_hold_start = None
 
@@ -173,6 +175,7 @@ def _process_knockdown_half(image_half, half_w, half_h, pose_model, state, runti
         right_hit = fl.right_visible and check_hit(target, *right_wrist_px)
         if left_hit or right_hit:
             state.register_recovery_hit(now)
+            sound.play("recovery_hit")
             target.flash_color = (0, 255, 0)
             target.flash_until = now + config.TARGET_HIT_FLASH_SECONDS
 
@@ -233,14 +236,15 @@ def run():
         )
 
     app_phase = MENU
-    num_players = None  # 1 or 2
-    preview_mode = False
 
     p1_state = PlayerState("P1")
     p2_state = PlayerState("P2")
     p1_runtime = PlayerRuntime()
     p2_runtime = PlayerRuntime()
-    dummy = DummyOpponent()
+
+    effects = []  # active impact-flash dicts: {"x_offset", "cx", "cy", "start"}
+    shake_until = 0.0
+    shake_magnitude = 0
 
     pose_p1 = None
     pose_p2 = None
@@ -256,7 +260,7 @@ def run():
 
         if app_phase == MENU:
             display = frame.copy()
-            cv2.putText(display, "1: Solo practice   2: 2-Player duel   3: Mirror preview (solo)",
+            cv2.putText(display, "SPACE: Start 2-Player duel",
                         (30, h // 2 - 25), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             cv2.putText(display, "F: toggle fullscreen   Q: quit",
                         (30, h // 2 + 25), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
@@ -266,9 +270,7 @@ def run():
                 break
             if key == ord("f"):
                 toggle_fullscreen()
-            if key in (ord("1"), ord("2"), ord("3")):
-                preview_mode = key == ord("3")
-                num_players = 2 if key == ord("2") else 1
+            if key == ord(" "):
                 pose_p1 = mp_pose.Pose(
                     min_detection_confidence=config.POSE_MIN_DETECTION_CONFIDENCE,
                     min_tracking_confidence=config.POSE_MIN_TRACKING_CONFIDENCE,
@@ -276,40 +278,32 @@ def run():
                 pose_p2 = mp_pose.Pose(
                     min_detection_confidence=config.POSE_MIN_DETECTION_CONFIDENCE,
                     min_tracking_confidence=config.POSE_MIN_TRACKING_CONFIDENCE,
-                ) if num_players == 2 else None
+                )
                 app_phase = CALIBRATION
             continue
 
-        mid = w // 2 if (num_players == 2 or preview_mode) else w
+        mid = w // 2
 
         if app_phase == CALIBRATION:
             left_half = frame[:, :mid]
+            right_half = frame[:, mid:]
             p1_ok, p1_msg, p1_fl = _run_calibration_frame(left_half, mid, h, pose_p1, p1_runtime, now)
-
-            if num_players == 2:
-                right_half = frame[:, mid:]
-                p2_ok, p2_msg, p2_fl = _run_calibration_frame(right_half, w - mid, h, pose_p2, p2_runtime, now)
-            else:
-                p2_ok, p2_msg, p2_fl = True, "Ready!", None
-                p2_runtime.calibration_hold_start = now  # dummy: always "held"
+            p2_ok, p2_msg, p2_fl = _run_calibration_frame(right_half, w - mid, h, pose_p2, p2_runtime, now)
 
             display = frame.copy()
             _draw_calibration_hud(display, 0, mid, h, p1_ok, p1_msg, p1_runtime.calibration_hold_start, now)
-            if num_players == 2:
-                _draw_calibration_hud(display, mid, w - mid, h, p2_ok, p2_msg, p2_runtime.calibration_hold_start, now)
-                cv2.line(display, (mid, 0), (mid, h), (255, 255, 255), 2)
+            _draw_calibration_hud(display, mid, w - mid, h, p2_ok, p2_msg, p2_runtime.calibration_hold_start, now)
+            cv2.line(display, (mid, 0), (mid, h), (255, 255, 255), 2)
 
             p1_ready = (p1_runtime.calibration_hold_start is not None
                         and now - p1_runtime.calibration_hold_start >= config.CALIBRATION_HOLD_SECONDS)
-            p2_ready = num_players == 1 or (
-                p2_runtime.calibration_hold_start is not None
-                and now - p2_runtime.calibration_hold_start >= config.CALIBRATION_HOLD_SECONDS
-            )
+            p2_ready = (p2_runtime.calibration_hold_start is not None
+                        and now - p2_runtime.calibration_hold_start >= config.CALIBRATION_HOLD_SECONDS)
 
             if p1_ready and p2_ready:
                 if p1_fl is not None:
                     p1_runtime.baseline_midline_x_px = p1_fl.midline_x * mid
-                if num_players == 2 and p2_fl is not None:
+                if p2_fl is not None:
                     p2_runtime.baseline_midline_x_px = p2_fl.midline_x * (w - mid)
                 app_phase = FIGHT
 
@@ -322,58 +316,20 @@ def run():
             continue
 
         # ---- FIGHT ----
-        if preview_mode:
-            left_half = frame[:, :mid]
-            display = frame.copy()
-            draw_ring_background(display, 0, mid, h)
-            draw_ring_background(display, mid, w - mid, h)
-
-            p1_fl, _fired = _process_fighting_half(left_half, mid, h, pose_p1, p1_runtime, 0)
-
-            if p1_fl is not None:
-                draw_own_hands(display, 0, mid, h, (p1_fl.left_wrist.x, p1_fl.left_wrist.y),
-                                (p1_fl.right_wrist.x, p1_fl.right_wrist.y))
-                p1_lean = _lean_offset(p1_fl, mid, p1_runtime.baseline_midline_x_px)
-                # This is the key thing being previewed: the SAME live pose
-                # data, rendered through draw_opponent's mirroring, is
-                # exactly what a real P2 would see of you.
-                draw_opponent(display, mid, w - mid, h, p1_lean, fl=p1_fl, downed=False)
-
-            cv2.line(display, (mid, 0), (mid, h), (255, 255, 255), 2)
-            cv2.putText(display, "YOU", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-            cv2.putText(display, "WHAT YOUR OPPONENT WOULD SEE", (mid + 20, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-            cv2.putText(display, "Lean/punch to test mirroring -- M: menu   Q: quit",
-                        (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            show(display)
-            key = cv2.waitKey(10) & 0xFF
-            if key == ord("q"):
-                break
-            if key == ord("f"):
-                toggle_fullscreen()
-            if key == ord("m"):
-                p1_runtime = PlayerRuntime()
-                app_phase = MENU
-                num_players = None
-                preview_mode = False
-            continue
-
+        p1_before, p2_before = p1_state.phase, p2_state.phase
         p1_state.tick(now)
-        if num_players == 2:
-            p2_state.tick(now)
+        p2_state.tick(now)
 
-        match_over = p1_state.phase == GAME_OVER or (num_players == 2 and p2_state.phase == GAME_OVER)
+        match_over = p1_state.phase == GAME_OVER or p2_state.phase == GAME_OVER
 
         left_half = frame[:, :mid]
-        right_half = frame[:, mid:] if num_players == 2 else None
+        right_half = frame[:, mid:]
 
         display = frame.copy()
 
         if not match_over:
             draw_ring_background(display, 0, mid, h)
-            if num_players == 2:
-                draw_ring_background(display, mid, w - mid, h)
+            draw_ring_background(display, mid, w - mid, h)
 
             # --- P1 ---
             p1_fl, p1_fired = (None, [])
@@ -382,83 +338,126 @@ def run():
             elif p1_state.phase == KNOCKDOWN:
                 p1_fl = _process_knockdown_half(left_half, mid, h, pose_p1, p1_state, p1_runtime, now)
 
-            # --- P2 / dummy ---
+            # --- P2 ---
             p2_fl, p2_fired = (None, [])
-            if num_players == 2:
-                if p2_state.phase == PLAYING:
-                    p2_fl, p2_fired = _process_fighting_half(right_half, w - mid, h, pose_p2, p2_runtime, mid)
-                elif p2_state.phase == KNOCKDOWN:
-                    p2_fl = _process_knockdown_half(right_half, w - mid, h, pose_p2, p2_state, p2_runtime, now)
+            if p2_state.phase == PLAYING:
+                p2_fl, p2_fired = _process_fighting_half(right_half, w - mid, h, pose_p2, p2_runtime, mid)
+            elif p2_state.phase == KNOCKDOWN:
+                p2_fl = _process_knockdown_half(right_half, w - mid, h, pose_p2, p2_state, p2_runtime, now)
 
             # --- Resolve punches thrown this frame ---
             p1_lean = _lean_offset(p1_fl, mid, p1_runtime.baseline_midline_x_px) if p1_fl else 0.0
-            p2_lean = (_lean_offset(p2_fl, w - mid, p2_runtime.baseline_midline_x_px)
-                       if (num_players == 2 and p2_fl) else 0.0)
+            p2_lean = _lean_offset(p2_fl, w - mid, p2_runtime.baseline_midline_x_px) if p2_fl else 0.0
 
             for side_name, zone in p1_fired:
-                if num_players == 2:
-                    if not is_dodged(zone, p2_lean):
-                        p2_state.take_damage(now, damage_for_zone(zone))
-                else:
-                    dummy.take_hit(zone)
+                if is_dodged(zone, p2_lean):
+                    continue
+                if _is_blocked(p2_fl, zone):
+                    sound.play("block")
+                    continue
+                p2_state.take_damage(now, damage_for_zone(zone))
+                sound.play("punch")
+                effects.append({"x_offset": mid, "cx": (w - mid) / 2,
+                                 "cy": h * config.IMPACT_POINT_Y_FRAC[zone], "start": now})
+                shake_until = max(shake_until, now + config.HIT_SHAKE_DURATION_SECONDS)
+                shake_magnitude = max(shake_magnitude, config.HIT_SHAKE_MAGNITUDE_PX[zone])
 
-            if num_players == 2:
-                for side_name, zone in p2_fired:
-                    if not is_dodged(zone, p1_lean):
-                        p1_state.take_damage(now, damage_for_zone(zone))
+            for side_name, zone in p2_fired:
+                if is_dodged(zone, p1_lean):
+                    continue
+                if _is_blocked(p1_fl, zone):
+                    sound.play("block")
+                    continue
+                p1_state.take_damage(now, damage_for_zone(zone))
+                sound.play("punch")
+                effects.append({"x_offset": 0, "cx": mid / 2,
+                                 "cy": h * config.IMPACT_POINT_Y_FRAC[zone], "start": now})
+                shake_until = max(shake_until, now + config.HIT_SHAKE_DURATION_SECONDS)
+                shake_magnitude = max(shake_magnitude, config.HIT_SHAKE_MAGNITUDE_PX[zone])
+
+            # --- Knockdown / KO transition sounds (covers both damage-
+            # triggered and count-timeout-triggered transitions) ---
+            for before, state in ((p1_before, p1_state), (p2_before, p2_state)):
+                if before == PLAYING and state.phase == KNOCKDOWN:
+                    sound.play("knockdown")
+                elif before != GAME_OVER and state.phase == GAME_OVER:
+                    sound.play("ko")
+                elif before == KNOCKDOWN and state.phase == PLAYING:
+                    sound.play("recovered")
 
             # --- Draw hands + opponent silhouettes ---
             if p1_fl is not None and p1_state.phase == PLAYING:
                 draw_own_hands(display, 0, mid, h, (p1_fl.left_wrist.x, p1_fl.left_wrist.y),
-                                (p1_fl.right_wrist.x, p1_fl.right_wrist.y))
-            opponent_lean_for_p1 = p2_lean if num_players == 2 else dummy.lean_offset
-            opponent_downed_for_p1 = num_players == 2 and p2_state.phase != PLAYING
-            opponent_fl_for_p1 = p2_fl if (num_players == 2 and p2_state.phase == PLAYING) else None
-            draw_opponent(display, 0, mid, h, opponent_lean_for_p1, fl=opponent_fl_for_p1,
-                          downed=opponent_downed_for_p1)
+                                (p1_fl.right_wrist.x, p1_fl.right_wrist.y), appearance=p1_runtime.appearance)
+            opponent_fl_for_p1 = p2_fl if p2_state.phase == PLAYING else None
+            draw_opponent(display, 0, mid, h, p2_lean, fl=opponent_fl_for_p1,
+                          downed=p2_state.phase != PLAYING, appearance=p2_runtime.appearance)
 
-            if num_players == 2:
-                if p2_fl is not None and p2_state.phase == PLAYING:
-                    draw_own_hands(display, mid, w - mid, h, (p2_fl.left_wrist.x, p2_fl.left_wrist.y),
-                                    (p2_fl.right_wrist.x, p2_fl.right_wrist.y))
-                p1_fl_for_p2 = p1_fl if p1_state.phase == PLAYING else None
-                draw_opponent(display, mid, w - mid, h, p1_lean, fl=p1_fl_for_p2, downed=p1_state.phase != PLAYING)
-                cv2.line(display, (mid, 0), (mid, h), (255, 255, 255), 2)
+            if p2_fl is not None and p2_state.phase == PLAYING:
+                draw_own_hands(display, mid, w - mid, h, (p2_fl.left_wrist.x, p2_fl.left_wrist.y),
+                                (p2_fl.right_wrist.x, p2_fl.right_wrist.y), appearance=p2_runtime.appearance)
+            p1_fl_for_p2 = p1_fl if p1_state.phase == PLAYING else None
+            draw_opponent(display, mid, w - mid, h, p1_lean, fl=p1_fl_for_p2, downed=p1_state.phase != PLAYING,
+                          appearance=p1_runtime.appearance)
+            cv2.line(display, (mid, 0), (mid, h), (255, 255, 255), 2)
 
-            # --- Recovery target overlay ---
+            # --- Recovery target overlay + big rising knockdown count ---
             for state, runtime, x_offset, half_width in (
                 (p1_state, p1_runtime, 0, mid),
-                *([(p2_state, p2_runtime, mid, w - mid)] if num_players == 2 else []),
+                (p2_state, p2_runtime, mid, w - mid),
             ):
-                if state.phase == KNOCKDOWN and runtime.recovery_target is not None:
+                if state.phase != KNOCKDOWN:
+                    continue
+
+                if runtime.recovery_target is not None:
                     t = runtime.recovery_target
-                    color = t.flash_color if t.flash_color is not None else (255, 255, 255)
-                    cv2.circle(display, (x_offset + int(t.x), int(t.y)), int(t.radius), color, 4)
-                    cv2.circle(display, (x_offset + int(t.x), int(t.y)), 6, color, -1)
+                    cx, cy = x_offset + int(t.x), int(t.y)
+                    if t.flash_color is not None:
+                        cv2.circle(display, (cx, cy), int(t.radius), t.flash_color, -1)
+                        cv2.circle(display, (cx, cy), int(t.radius), (255, 255, 255), 3)
+                    else:
+                        draw_floating_sphere(display, cx, cy, int(t.radius), (60, 140, 230), now)
+
+                elapsed = now - state.knockdown_start_time
+                count = min(10, int(elapsed) + 1)
+                text = str(count)
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 4.0, 8)
+                cv2.putText(display, text, (x_offset + half_width // 2 - tw // 2, int(h * 0.30) + th // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 4.0, (0, 0, 255), 8)
 
             # --- HUD ---
             def hud_text(state):
                 if state.phase == PLAYING:
                     return f"{state.name}: HP {state.hp}/{state.max_hp}", (255, 255, 255)
                 if state.phase == KNOCKDOWN:
-                    remaining = max(0.0, config.KNOCKDOWN_TIME_LIMIT_SECONDS - (now - state.knockdown_start_time))
-                    return f"{state.name} DOWN! {state.knockdown_hits}/{state.required_hits} -- {remaining:.1f}s", (0, 0, 255)
+                    return f"{state.name} DOWN! {state.knockdown_hits}/{state.required_hits} hits", (0, 0, 255)
                 return f"{state.name} IS OUT", (0, 0, 255)
 
-            if num_players == 2:
-                text, color = hud_text(p1_state)
-                cv2.putText(display, text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                text, color = hud_text(p2_state)
-                cv2.putText(display, text, (mid + 20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            else:
-                cv2.putText(display, f"Hits -- HEAD:{dummy.hits_by_zone['HEAD']} "
-                                      f"BODY:{dummy.hits_by_zone['BODY']} LOW:{dummy.hits_by_zone['LOW']}",
-                            (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+            text, color = hud_text(p1_state)
+            cv2.putText(display, text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            text, color = hud_text(p2_state)
+            cv2.putText(display, text, (mid + 20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+            # --- Impact flashes ---
+            still_active = []
+            for fx in effects:
+                age = now - fx["start"]
+                if age < config.HIT_FLASH_DURATION_SECONDS:
+                    draw_impact_flash(display, fx["x_offset"], fx["cx"], fx["cy"], age, config.HIT_FLASH_DURATION_SECONDS)
+                    still_active.append(fx)
+            effects = still_active
 
         if match_over:
-            winner = "P1" if (num_players == 1 or p2_state.phase == GAME_OVER) else "P2"
+            winner = "P1" if p2_state.phase == GAME_OVER else "P2"
             cv2.putText(display, f"{winner} WINS! Press R to restart, Q to quit",
                         (30, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
+
+        if now < shake_until:
+            dx = np.random.randint(-shake_magnitude, shake_magnitude + 1)
+            dy = np.random.randint(-shake_magnitude, shake_magnitude + 1)
+            shake_matrix = np.float32([[1, 0, dx], [0, 1, dy]])
+            display = cv2.warpAffine(display, shake_matrix, (display.shape[1], display.shape[0]),
+                                      borderMode=cv2.BORDER_REPLICATE)
 
         show(display)
 
@@ -472,9 +471,10 @@ def run():
             p2_state.reset()
             p1_runtime = PlayerRuntime()
             p2_runtime = PlayerRuntime()
-            dummy = DummyOpponent()
+            effects = []
+            shake_until = 0.0
+            shake_magnitude = 0
             app_phase = MENU
-            num_players = None
 
     cap.release()
     cv2.destroyAllWindows()

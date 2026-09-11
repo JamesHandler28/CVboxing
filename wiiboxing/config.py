@@ -75,23 +75,63 @@ TARGET_MISS_FLASH_SECONDS = 0.35
 
 # ---------------------------------------------------------------------------
 # Duel mode: two players, each with HP. Your punch connects on the OTHER
-# player and damages them (a real opponent, not a self-miss abstraction).
-# Head shots can be dodged by leaning far enough; body/low shots always
-# land. Hit zero HP and you're knocked down -- you get a time-limited
-# window to punch a floating target back up (same recovery minigame as
-# freeplay mode), but with lower max HP each time. Fail a recovery window
-# and you lose the match.
+# player and damages them (a real opponent, not a self-miss abstraction),
+# unless they block it (their own glove is covering the zone you aimed at
+# -- see GLOVE_BLOCK_COVERAGE below) or dodge it (head shots only, via
+# leaning far enough). Hit zero HP and you're knocked down -- you get a
+# time-limited window to punch a floating recovery target back up, with
+# your returned HP scaling with how well you do (see
+# DUEL_RECOVERY_MIN_HP_FRACTION below), at the cost of a lower max-HP
+# ceiling each time. Fail a recovery window, or reach your MAX_KNOCKDOWNS'th
+# knockdown (no recovery chance at all), and you lose the match.
 # ---------------------------------------------------------------------------
 DUEL_MAX_HP = 100
 DUEL_HEAD_DAMAGE = 30
 DUEL_BODY_DAMAGE = 18
 DUEL_LOW_DAMAGE = 10
-DUEL_HP_REDUCTION_PER_KNOCKDOWN = 20  # max HP lost each time you get back up
+DUEL_HP_REDUCTION_PER_KNOCKDOWN = 20  # max HP ceiling lost each successful recovery
 DUEL_MAX_HP_FLOOR = 20             # max HP never drops below this
 
 KNOCKDOWN_TIME_LIMIT_SECONDS = 10.0  # time to hit enough targets to get back up
 KNOCKDOWN_BASE_REQUIRED_HITS = 3   # hits needed on your first knockdown
 KNOCKDOWN_REQUIRED_HITS_INCREMENT = 1  # extra hits required each subsequent knockdown
+
+MAX_KNOCKDOWNS = 3  # the Nth knockdown is an automatic KO -- no recovery
+# minigame at all, matching a real three-knockdown-rule finish.
+
+# ---------------------------------------------------------------------------
+# Recovery HP scaling: landing exactly `required_hits` gets you back up with
+# only a fraction of your (reduced) new max HP. Every extra hit beyond that
+# scales your returned HP up continuously, capping out at full new-max-HP
+# once you've landed DUEL_RECOVERY_EXTRA_HITS_FOR_FULL_HP hits past the
+# requirement -- so recovery performance actually matters, not just clearing
+# the bar.
+# ---------------------------------------------------------------------------
+DUEL_RECOVERY_MIN_HP_FRACTION = 0.4
+DUEL_RECOVERY_EXTRA_HITS_FOR_FULL_HP = 5
+
+# ---------------------------------------------------------------------------
+# Blocking: a punch aimed at a zone is blocked outright if the DEFENDER's
+# own wrist is currently positioned to cover that zone. Boxing gloves are
+# bulkier than a bare fist, so the effective coverage extends a bit past
+# the wrist's exact tracked position -- see glove_covers_zone() in
+# pose_utils.py. Expressed as a fraction of shoulder width, added on both
+# sides of each zone boundary.
+# ---------------------------------------------------------------------------
+GLOVE_BLOCK_COVERAGE = 0.35
+
+# ---------------------------------------------------------------------------
+# Hit feedback: a brief impact flash + screen shake when a punch actually
+# lands (not blocked or dodged). Shake magnitude scales with the zone hit
+# (a head shot should feel like more of a jolt than a low shot). Impact
+# position is approximate -- a fixed point in the defender's half per zone,
+# not the exact tracked contact point, which keeps this simple and in
+# keeping with the rest of the shape-based rendering.
+# ---------------------------------------------------------------------------
+HIT_FLASH_DURATION_SECONDS = 0.25
+HIT_SHAKE_DURATION_SECONDS = 0.15
+HIT_SHAKE_MAGNITUDE_PX = {"HEAD": 12, "BODY": 7, "LOW": 4}
+IMPACT_POINT_Y_FRAC = {"HEAD": 0.30, "BODY": 0.55, "LOW": 0.75}
 
 # ---------------------------------------------------------------------------
 # Dodging: leaning shifts your on-screen position relative to your own

@@ -34,3 +34,24 @@ def classify_height(wrist, nose, hip_y, shoulder_w, head_zone_margin):
     if wrist.y < hip_y:
         return "BODY"
     return "LOW"
+
+
+def glove_covers_zone(wrist, nose, hip_y, shoulder_w, zone, coverage_margin):
+    """Whether a wrist -- given an enlarged, glove-sized hitbox rather than
+    a bare-fist point -- is positioned to block a punch aimed at `zone`.
+
+    `coverage_margin` (a fraction of shoulder width) is added on both sides
+    of each zone boundary: a boxing glove is bulkier than a fist, and can
+    intercept a shot even when the wrist's tracked center isn't exactly
+    inside the target zone.
+    """
+    if shoulder_w < 1e-6:
+        return False
+    margin = shoulder_w * coverage_margin
+    head_boundary = nose.y + margin
+    body_boundary = hip_y
+    if zone == "HEAD":
+        return wrist.y < head_boundary + margin
+    if zone == "BODY":
+        return head_boundary - margin <= wrist.y < body_boundary + margin
+    return wrist.y >= body_boundary - margin
